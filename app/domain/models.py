@@ -216,6 +216,7 @@ class PredictionResult:
     local_explanations: dict[str, Any]
     global_explanations: dict[str, Any]
     pedagogical_summary: str
+    probability_label: str = "Probabilidad"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

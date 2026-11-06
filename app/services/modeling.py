@@ -217,7 +217,7 @@ class ModelRegistry:
                 random_state=42,
             )
             if bundle.exercise == ExerciseOption.DEFAULT_RISK
-            else LogisticRegression(max_iter=1000, random_state=42)
+            else LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced")
         )
         model = Pipeline(
             steps=[
@@ -226,6 +226,9 @@ class ModelRegistry:
             ]
         )
         model.fit(bundle.df[bundle.features], bundle.df[bundle.target])
+        transformed = model.named_steps["preprocessor"].transform(bundle.df[bundle.features])
+        transformed = transformed.toarray() if hasattr(transformed, "toarray") else transformed
+        model.background_mean_ = np.asarray(transformed, dtype=float).mean(axis=0)
         return model
 
     def get_model(self, exercise: str) -> tuple[Pipeline, DatasetBundle]:
@@ -236,7 +239,7 @@ class ModelRegistry:
 
 
 EVALUATION_CLASS_LABELS = {
-    ExerciseOption.CREDIT_APPROVAL: ("Requiere revisión", "Aprobado"),
+    ExerciseOption.CREDIT_APPROVAL: ("Aprobado", "Requiere revisión"),
     ExerciseOption.DEFAULT_RISK: ("Sin mora", "Mora"),
 }
 
@@ -359,7 +362,9 @@ class ExplainabilityService:
     ) -> tuple[pd.DataFrame, np.ndarray, list[str]]:
         preprocessor = pipeline.named_steps["preprocessor"]
         transformed = preprocessor.transform(pd.DataFrame([inputs]))
-        feature_names = preprocessor.get_feature_names_out().tolist()
+        feature_names = [
+            name.split("__", 1)[-1] for name in preprocessor.get_feature_names_out().tolist()
+        ]
         transformed_array = transformed.toarray() if hasattr(transformed, "toarray") else transformed
         transformed_df = pd.DataFrame(transformed_array, columns=feature_names)
         return transformed_df, transformed_array, feature_names
@@ -374,14 +379,7 @@ class ExplainabilityService:
             try:
                 explainer = shap.TreeExplainer(classifier)
                 shap_values = explainer.shap_values(transformed_df)
-                if isinstance(shap_values, list):
-                    if len(shap_values) > 1:
-                        shap_values = shap_values[1]
-                    elif len(shap_values) == 1:
-                        shap_values = shap_values[0]
-                    else:
-                        shap_values = np.zeros((1, len(feature_names)))
-                shap_array = np.ravel(shap_values)
+                shap_array = np.ravel(_positive_class_shap_values(shap_values)[0])
                 slice_count = min(len(feature_names), shap_array.size)
                 shap_array = shap_array[:slice_count]
                 feature_names = feature_names[:slice_count]
@@ -413,7 +411,11 @@ class ExplainabilityService:
             )
 
         transformed_array = transformed_array if isinstance(transformed_array, np.ndarray) else np.array(transformed_array)
-        contributions = np.ravel(transformed_array) * classifier.coef_[0]
+        row = np.ravel(transformed_array).astype(float)
+        background = getattr(pipeline, "background_mean_", None)
+        if background is not None and np.shape(background) == row.shape:
+            row = row - np.asarray(background, dtype=float)
+        contributions = row * classifier.coef_[0]
         local = sorted(
             [
                 {"feature": feature, "impact": float(value)}
@@ -431,7 +433,7 @@ class ExplainabilityService:
             reverse=True,
         )
         return (
-            {"items": local[:10], "provider": "linear_shap_surrogate"},
+            {"items": local[:10], "provider": "linear_shap"},
             {"items": global_payload[:12], "provider": "coefficient_global_importance"},
         )
 
@@ -443,14 +445,15 @@ class PedagogicalExplanationAgent:
         prediction_label: str,
         probability: float,
         local_items: list[dict[str, Any]],
+        target_text: str = "la probabilidad",
     ) -> str:
         top = ", ".join(
-            f"{item['feature']} ({'aumenta' if item['impact'] >= 0 else 'reduce'} la probabilidad)"
+            f"{item['feature']} ({'aumenta' if item['impact'] >= 0 else 'reduce'} {target_text})"
             for item in local_items[:3]
         )
         return (
             f"En {exercise_label}, el modelo clasificó el caso como '{prediction_label}' "
-            f"con una probabilidad estimada de {probability:.1%}. "
+            f"con {target_text} estimada de {probability:.1%}. "
             f"Las variables con mayor peso local fueron {top}. "
             "La interpretación pedagógica es que el modelo compara el perfil actual con patrones históricos "
             "y usa esas señales para justificar la decisión."
@@ -464,7 +467,7 @@ class PredictionService:
         self.agent = PedagogicalExplanationAgent()
 
     @staticmethod
-    def _positive_class_for_exercise(exercise: str) -> int:
+    def _risk_class_for_exercise(exercise: str) -> int:
         positive_classes = {
             ExerciseOption.CREDIT_APPROVAL: 1,
             ExerciseOption.DEFAULT_RISK: 1,
@@ -473,7 +476,7 @@ class PredictionService:
 
     def _positive_class_probability(self, pipeline: Pipeline, exercise: str, features: dict[str, Any]) -> float:
         classes = list(pipeline.named_steps["classifier"].classes_)
-        positive_class = self._positive_class_for_exercise(exercise)
+        positive_class = self._risk_class_for_exercise(exercise)
         if positive_class not in classes:
             raise ValueError(
                 f"Positive class {positive_class!r} is not available for exercise {exercise!r}."
@@ -484,14 +487,28 @@ class PredictionService:
 
     def predict(self, exercise: str, features: dict[str, Any]) -> PredictionResult:
         pipeline, bundle = self.registry.get_model(exercise)
-        probability = self._positive_class_probability(pipeline, exercise, features)
+        risk_probability = self._positive_class_probability(pipeline, exercise, features)
         classifier = pipeline.named_steps["classifier"]
-        if exercise == ExerciseOption.CREDIT_APPROVAL:
-            label = "Aprobado" if probability >= 0.5 else "Requiere revisión"
-        else:
-            label = "Alta probabilidad de mora" if probability >= 0.5 else "Baja probabilidad de mora"
         local, global_payload = self.explainer.build_explanations(pipeline, features)
-        summary = self.agent.explain(bundle.label, label, probability, local["items"])
+        if exercise == ExerciseOption.CREDIT_APPROVAL:
+            probability = 1.0 - risk_probability
+            label = "Aprobado" if probability >= 0.5 else "Requiere revisión"
+            probability_label = "Probabilidad de aprobación"
+            target_text = "la probabilidad de aprobación"
+            local = {
+                **local,
+                "items": [
+                    {**item, "impact": -float(item["impact"])} for item in local["items"]
+                ],
+            }
+        else:
+            probability = risk_probability
+            label = "Alta probabilidad de mora" if probability >= 0.5 else "Baja probabilidad de mora"
+            probability_label = "Probabilidad de mora"
+            target_text = "la probabilidad de mora"
+        summary = self.agent.explain(
+            bundle.label, label, probability, local["items"], target_text=target_text
+        )
         provider = (
             "decision_tree"
             if isinstance(classifier, DecisionTreeClassifier)
@@ -509,4 +526,5 @@ class PredictionService:
             },
             global_explanations={"shap_global": global_payload},
             pedagogical_summary=summary,
+            probability_label=probability_label,
         )

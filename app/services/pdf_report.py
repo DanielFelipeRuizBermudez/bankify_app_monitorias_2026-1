@@ -224,9 +224,10 @@ def build_feedback_report_pdf(
             f"{probability:.1%}" if isinstance(probability, (int, float)) else "N/D"
         )
         label = escape(str(prediction_output.get("label", "N/D")))
+        probability_label = escape(str(prediction_output.get("probability_label", "Probabilidad")))
         story.append(
             Paragraph(
-                f"Resultado de tu simulación: <b>{label}</b> (confianza: {probability_text})",
+                f"Resultado de tu simulación: <b>{label}</b> ({probability_label.lower()}: {probability_text})",
                 styles["body"],
             )
         )

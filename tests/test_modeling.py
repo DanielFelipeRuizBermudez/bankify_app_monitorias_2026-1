@@ -46,8 +46,9 @@ class _FakeAgent:
         prediction_label: str,
         probability: float,
         local_items: list[dict[str, Any]],
+        target_text: str = "la probabilidad",
     ) -> str:
-        del local_items
+        del local_items, target_text
         return f"{exercise_label}: {prediction_label} ({probability:.1%})"
 
 
@@ -86,5 +87,7 @@ def test_credit_approval_uses_explicit_positive_class_probability() -> None:
 
     result = service.predict(ExerciseOption.CREDIT_APPROVAL, {"f1": 1})
 
-    assert result.probability == 0.1
-    assert result.label == "Requiere revisión"
+    assert result.probability == 0.9
+    assert result.label == "Aprobado"
+    assert result.probability_label == "Probabilidad de aprobación"
+    assert result.local_explanations["shap_local"]["items"][0]["impact"] == -0.2

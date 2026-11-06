@@ -49,7 +49,7 @@ def _render_simulation_card(exercise_label: str, prediction_cache: dict) -> None
                 <span class="bankify-status-dot {status_class}"></span>{label}
             </p>
             <div class="bankify-simulation-confidence-row">
-                <span>Puntaje de confianza</span>
+                <span>{prediction_cache.get('probability_label', 'Probabilidad')}</span>
                 <span>{prediction_cache['probability']:.1%}</span>
             </div>
             <div class="bankify-simulation-track">
@@ -62,10 +62,19 @@ def _render_simulation_card(exercise_label: str, prediction_cache: dict) -> None
 
 
 def _render_kpi_stack(evaluation: ModelEvaluationResult) -> None:
+    positive_label = evaluation.class_labels[1]
     metrics = [
         ("Exactitud", evaluation.accuracy, "De todas las predicciones, qué porcentaje fue correcto."),
-        ("Precisión", evaluation.precision, "De los casos marcados como positivos, qué porcentaje lo era de verdad."),
-        ("Exhaustividad (Recall)", evaluation.recall, "De los casos positivos reales, qué porcentaje detectó el modelo."),
+        (
+            "Precisión",
+            evaluation.precision,
+            f"De los casos que el modelo marcó como «{positive_label}», qué porcentaje lo era de verdad.",
+        ),
+        (
+            "Exhaustividad (Recall)",
+            evaluation.recall,
+            f"De los casos que realmente eran «{positive_label}», qué porcentaje detectó el modelo.",
+        ),
         ("F1-Score", evaluation.f1, "Balance entre precision y recall."),
     ]
     cards = "".join(
@@ -79,6 +88,80 @@ def _render_kpi_stack(evaluation: ModelEvaluationResult) -> None:
         for label, value, hint in metrics
     )
     _html(f"<div class='bankify-kpi-stack'>{cards}</div>")
+
+
+RISK_COLOR = "#be123c"
+FAVORABLE_COLOR = "#00c29b"
+
+
+def _signed_bar_chart(
+    items: list[dict],
+    value_key: str,
+    toward_label: str,
+    away_label: str,
+    toward_color: str,
+    away_color: str,
+    title: str,
+    axis_title: str,
+) -> go.Figure:
+    ordered = list(reversed(items))
+    fig = go.Figure()
+    for name, color, keep in (
+        (f"Empuja hacia «{toward_label}»", toward_color, lambda value: value >= 0),
+        (f"Empuja hacia «{away_label}»", away_color, lambda value: value < 0),
+    ):
+        selected = [item for item in ordered if keep(item[value_key])]
+        fig.add_trace(
+            go.Bar(
+                x=[item[value_key] for item in selected],
+                y=[item["feature"] for item in selected],
+                orientation="h",
+                marker_color=color,
+                name=name,
+                hovertemplate="%{y}: %{x:.3f}<extra>" + name + "</extra>",
+            )
+        )
+    fig.add_vline(x=0, line_width=1, line_color="#94a3b8")
+    fig.update_layout(
+        title=dict(text=title, x=0, font=dict(size=15)),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=400,
+        barmode="relative",
+        xaxis_title=axis_title,
+        yaxis=dict(categoryorder="array", categoryarray=[item["feature"] for item in ordered]),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, x=0),
+    )
+    return fig
+
+
+def _render_local_explanation(prediction_cache: dict, evaluation: ModelEvaluationResult) -> None:
+    items = (prediction_cache.get("local_explanations", {}).get("shap_local", {}) or {}).get("items", [])
+    if not items:
+        return
+    negative_label, positive_label = evaluation.class_labels
+    if prediction_cache.get("exercise") == ExerciseOption.CREDIT_APPROVAL:
+        toward_label, away_label = negative_label, positive_label
+        toward_color, away_color = FAVORABLE_COLOR, RISK_COLOR
+    else:
+        toward_label, away_label = positive_label, negative_label
+        toward_color, away_color = RISK_COLOR, FAVORABLE_COLOR
+    fig = _signed_bar_chart(
+        items[:8],
+        "impact",
+        toward_label,
+        away_label,
+        toward_color,
+        away_color,
+        title="¿Por qué el modelo dio este resultado para tu caso? (SHAP local)",
+        axis_title=f"Contribución a la probabilidad de «{toward_label}»  ·  ← «{away_label}»  |  «{toward_label}» →",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"Cada barra muestra cuánto movió esa variable la probabilidad de «{toward_label}» para el caso "
+        f"que simulaste. Las barras hacia la derecha aumentan la probabilidad de «{toward_label}»; "
+        f"las barras hacia la izquierda la reducen, es decir, acercan el caso a «{away_label}». "
+        "La longitud indica qué tanto pesó la variable en esta predicción."
+    )
 
 
 def _render_results_socialization(evaluation: ModelEvaluationResult) -> None:
@@ -122,30 +205,32 @@ def _render_results_socialization(evaluation: ModelEvaluationResult) -> None:
         </div>
         """
     )
+    st.caption(
+        f"Las celdas verdes son aciertos: casos «{negative_label}» que el modelo predijo como «{negative_label}» "
+        f"({tn}) y casos «{positive_label}» que predijo como «{positive_label}» ({tp}). Las celdas rojas son "
+        f"errores: {fp} casos «{negative_label}» clasificados como «{positive_label}» y {fn} casos "
+        f"«{positive_label}» clasificados como «{negative_label}»."
+    )
 
     if evaluation.coefficient_importance is not None:
         _html("<p class='bankify-cm-tag'>Coeficientes del modelo (betas)</p>")
-        top_items = list(reversed(evaluation.coefficient_importance[:8]))
-        bar_colors = ["#00c29b" if item["coefficient"] >= 0 else "#be123c" for item in top_items]
-        fig = go.Figure(
-            go.Bar(
-                x=[item["coefficient"] for item in top_items],
-                y=[item["feature"] for item in top_items],
-                orientation="h",
-                marker_color=bar_colors,
-            )
-        )
-        fig.add_vline(x=0, line_width=1, line_color="#94a3b8")
-        fig.update_layout(
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=340,
-            xaxis_title="Coeficiente (beta) sobre la variable estandarizada",
+        fig = _signed_bar_chart(
+            evaluation.coefficient_importance[:8],
+            "coefficient",
+            positive_label,
+            negative_label,
+            RISK_COLOR,
+            FAVORABLE_COLOR,
+            title=f"Qué variables empujan hacia «{positive_label}» y cuáles hacia «{negative_label}»",
+            axis_title=f"Coeficiente (beta) estandarizado  ·  ← «{negative_label}»  |  «{positive_label}» →",
         )
         st.plotly_chart(fig, use_container_width=True)
         st.caption(
-            "Un beta positivo (turquesa) aumenta la probabilidad de la clase positiva; "
-            "un beta negativo (rojo) la reduce. Por ser un modelo de regresión logística, "
-            "estos coeficientes son directamente interpretables."
+            f"La regresión logística estima la probabilidad de «{positive_label}». Una barra roja hacia la "
+            f"derecha (beta positivo) significa que, al aumentar esa variable, aumenta la probabilidad de "
+            f"«{positive_label}». Una barra turquesa hacia la izquierda (beta negativo) significa que, al "
+            f"aumentar esa variable, aumenta la probabilidad de «{negative_label}». Como las variables están "
+            "estandarizadas, una barra más larga indica una variable con más efecto."
         )
     else:
         _html("<p class='bankify-cm-tag'>Variables con mayor peso en la predicción (SHAP)</p>")
@@ -155,15 +240,23 @@ def _render_results_socialization(evaluation: ModelEvaluationResult) -> None:
                 x=[item["importance"] for item in top_items],
                 y=[item["feature"] for item in top_items],
                 orientation="h",
-                marker_color="#00c29b",
+                marker_color="#64748b",
+                hovertemplate="%{y}: %{x:.3f}<extra></extra>",
             )
         )
         fig.update_layout(
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=340,
-            xaxis_title="Impacto medio en la predicción (|SHAP|)",
+            title=dict(text=f"Qué variables pesan más al estimar la probabilidad de «{positive_label}»", x=0, font=dict(size=15)),
+            margin=dict(l=10, r=10, t=50, b=10),
+            height=360,
+            xaxis_title=f"Impacto promedio sobre la probabilidad de «{positive_label}» (|SHAP|, sin dirección)",
         )
         st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            f"Cada barra mide cuánto mueve, en promedio, esa variable la probabilidad de «{positive_label}» "
+            "en los casos de prueba. Es una medida de importancia, no de dirección: una barra larga indica "
+            f"una variable muy influyente, pero no dice si acerca los casos a «{positive_label}» o a "
+            f"«{negative_label}». Para ver la dirección, revisa la gráfica de tu caso simulado."
+        )
 
 
 class SequentialLearningFlow:
@@ -785,6 +878,7 @@ class SequentialLearningFlow:
                     </div>
                     """
                 )
+                _render_local_explanation(prediction_cache, evaluation)
 
         if prediction_cache:
             progress = self._exercise_progress(record, bundle.exercise)
